@@ -136,11 +136,11 @@ function serializeBook(book: {
   };
 }
 
-async function maximumTracePage(userId: string, bookId: string): Promise<number> {
+async function maximumTracePage(tx: Prisma.TransactionClient, userId: string, bookId: string): Promise<number> {
   const [dogEar, annotation, reread] = await Promise.all([
-    prisma.dogEar.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } }),
-    prisma.annotation.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { endPage: true } }),
-    prisma.rereadMark.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } })
+    tx.dogEar.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } }),
+    tx.annotation.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { endPage: true } }),
+    tx.rereadMark.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } })
   ]);
   return Math.max(
     dogEar._max.pageNumber ?? 0,
@@ -308,12 +308,9 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
     if (parsed.data.version && parsed.data.version !== existing.version) {
       throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
     }
-    if (parsed.data.pageCount !== undefined && parsed.data.pageCount !== null) {
-      const maxPage = await maximumTracePage(userId, bookId);
-      if (parsed.data.pageCount < maxPage) {
-        throw new AppError(409, 'PAGE_COUNT_TOO_SMALL', `总页数不能小于已有痕迹的最大页码 ${maxPage}`);
-      }
-    }
+    // 仅在总页数实际变化时校验；存量越界数据不阻塞其他字段的保存
+    const pageCountChanged =
+      parsed.data.pageCount !== undefined && parsed.data.pageCount !== existing.pageCount;
 
     const data: Prisma.BookUpdateManyMutationInput = {};
     if (parsed.data.title !== undefined) data.title = normalizeText(parsed.data.title);
@@ -327,6 +324,13 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
     if (Object.keys(data).length === 0) return { book: serializeBook(existing) };
 
     const result = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${bookId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
+      if (pageCountChanged && parsed.data.pageCount !== undefined && parsed.data.pageCount !== null) {
+        const maxPage = await maximumTracePage(tx, userId, bookId);
+        if (parsed.data.pageCount < maxPage) {
+          throw new AppError(409, 'PAGE_COUNT_TOO_SMALL', `总页数不能小于已有痕迹的最大页码 ${maxPage}`);
+        }
+      }
       const updated = await tx.book.updateMany({
         where: { id: bookId, userId, deletedAt: null, version: existing.version },
         data: { ...data, version: { increment: 1 } }

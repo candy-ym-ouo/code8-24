@@ -5,7 +5,7 @@ import { TRACE_TYPES, type TraceType } from '@paper-book-traces/shared';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
-import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
+import { assertPagesRestorable, isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
 import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
 
@@ -310,21 +310,26 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.post('/dog-ears/:dogEarId/restore', async (request) => {
     const id = parseId((request.params as { dogEarId: string }).dogEarId, 'dogEarId');
     const userId = currentUser(request).id;
-    const existing = await prisma.dogEar.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除折角不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
-    }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
-    const duplicate = await prisma.dogEar.findFirst({
-      where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
-    });
-    if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.dogEar.update({
-        where: { id },
+      const existing = await tx.dogEar.findFirst({ where: { id, userId } });
+      if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除折角不存在');
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${existing.bookId}::uuid FOR UPDATE`;
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (!isRestoreWindowOpen(existing.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      assertPagesRestorable([existing.pageNumber], book.pageCount);
+      const duplicate = await tx.dogEar.findFirst({
+        where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
+      });
+      if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
+      const result = await tx.dogEar.updateMany({
+        where: { id, deletedAt: existing.deletedAt },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '折角已在其他位置被修改');
+      const value = await tx.dogEar.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
@@ -436,17 +441,22 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.post('/annotations/:annotationId/restore', async (request) => {
     const id = parseId((request.params as { annotationId: string }).annotationId, 'annotationId');
     const userId = currentUser(request).id;
-    const existing = await prisma.annotation.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除批注不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
-    }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.annotation.update({
-        where: { id },
+      const existing = await tx.annotation.findFirst({ where: { id, userId } });
+      if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除批注不存在');
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${existing.bookId}::uuid FOR UPDATE`;
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (!isRestoreWindowOpen(existing.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      assertPagesRestorable([existing.startPage, existing.endPage], book.pageCount);
+      const result = await tx.annotation.updateMany({
+        where: { id, deletedAt: existing.deletedAt },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '批注已在其他位置被修改');
+      const value = await tx.annotation.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
@@ -557,17 +567,22 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.post('/reread-marks/:rereadMarkId/restore', async (request) => {
     const id = parseId((request.params as { rereadMarkId: string }).rereadMarkId, 'rereadMarkId');
     const userId = currentUser(request).id;
-    const existing = await prisma.rereadMark.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除重读记录不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
-    }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.rereadMark.update({
-        where: { id },
+      const existing = await tx.rereadMark.findFirst({ where: { id, userId } });
+      if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除重读记录不存在');
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${existing.bookId}::uuid FOR UPDATE`;
+      const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
+      if (!isRestoreWindowOpen(existing.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      assertPagesRestorable([existing.pageNumber], book.pageCount);
+      const result = await tx.rereadMark.updateMany({
+        where: { id, deletedAt: existing.deletedAt },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '重读记录已在其他位置被修改');
+      const value = await tx.rereadMark.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,

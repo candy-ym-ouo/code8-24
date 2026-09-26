@@ -22,6 +22,11 @@ export function parsePositivePage(value: number, field = 'pageNumber'): number {
   return value;
 }
 
+export function pagesWithinPageCount(pages: number[], pageCount: number | null): boolean {
+  if (pageCount === null) return true;
+  return pages.every((page) => page <= pageCount);
+}
+
 export function validatePageRange(startPage: number, endPage: number, pageCount: number | null): void {
   parsePositivePage(startPage, 'startPage');
   parsePositivePage(endPage, 'endPage');
@@ -30,7 +35,7 @@ export function validatePageRange(startPage: number, endPage: number, pageCount:
       endPage: '结束页必须大于等于起始页'
     });
   }
-  if (pageCount !== null && endPage > pageCount) {
+  if (!pagesWithinPageCount([endPage], pageCount)) {
     throw new AppError(422, 'VALIDATION_ERROR', `页码不能超过总页数 ${pageCount}`, {
       endPage: `页码不能超过总页数 ${pageCount}`
     });
@@ -39,11 +44,21 @@ export function validatePageRange(startPage: number, endPage: number, pageCount:
 
 export function validateSinglePage(pageNumber: number, pageCount: number | null): void {
   parsePositivePage(pageNumber);
-  if (pageCount !== null && pageNumber > pageCount) {
+  if (!pagesWithinPageCount([pageNumber], pageCount)) {
     throw new AppError(422, 'VALIDATION_ERROR', `页码不能超过总页数 ${pageCount}`, {
       pageNumber: `页码不能超过总页数 ${pageCount}`
     });
   }
+}
+
+export function assertPagesRestorable(pages: number[], pageCount: number | null): void {
+  if (pagesWithinPageCount(pages, pageCount)) return;
+  const maxPage = Math.max(...pages);
+  throw new AppError(
+    409,
+    'PAGE_OUT_OF_RANGE',
+    `痕迹页码 ${maxPage} 超出当前总页数 ${pageCount}，请先将总页数调整为不少于 ${maxPage} 再恢复`
+  );
 }
 
 export function assertBookStatus(value: string): asserts value is BookStatus {
