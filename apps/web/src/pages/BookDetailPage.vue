@@ -360,6 +360,9 @@ function eventSummary(payload: Record<string, unknown>): string {
     const end = typeof payload.endPage === 'number' ? payload.endPage : payload.startPage;
     return `第 ${payload.startPage}–${end} 页`;
   }
+  if (typeof payload.previousPageCount === 'number' && typeof payload.pageCount === 'number') {
+    return `总页数 ${payload.previousPageCount} → ${payload.pageCount}`;
+  }
   if (Array.isArray(payload.moodTags)) return payload.moodTags.map((tag) => MOOD_LABELS[tag as MoodTag] ?? tag).join('、');
   if (payload.cascade) return '随书目删除';
   return '';

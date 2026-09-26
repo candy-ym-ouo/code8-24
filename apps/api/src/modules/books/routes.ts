@@ -6,6 +6,7 @@ import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { normalizeMoodTags, normalizeText, validateStatusTransition } from '../../lib/domain.js';
+import { getActiveTraceMaxPage } from '../../lib/traceConsistency.js';
 import { writeEvent } from '../../lib/events.js';
 import { paginationFromQuery, parseId } from '../../lib/http.js';
 
@@ -134,19 +135,6 @@ function serializeBook(book: {
     createdAt: book.createdAt,
     updatedAt: book.updatedAt
   };
-}
-
-async function maximumTracePage(userId: string, bookId: string): Promise<number> {
-  const [dogEar, annotation, reread] = await Promise.all([
-    prisma.dogEar.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } }),
-    prisma.annotation.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { endPage: true } }),
-    prisma.rereadMark.aggregate({ where: { userId, bookId, deletedAt: null }, _max: { pageNumber: true } })
-  ]);
-  return Math.max(
-    dogEar._max.pageNumber ?? 0,
-    annotation._max.endPage ?? 0,
-    reread._max.pageNumber ?? 0
-  );
 }
 
 export const bookRoutes: FastifyPluginAsync = async (app) => {
@@ -309,7 +297,7 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
     }
     if (parsed.data.pageCount !== undefined && parsed.data.pageCount !== null) {
-      const maxPage = await maximumTracePage(userId, bookId);
+      const maxPage = await getActiveTraceMaxPage(prisma, userId, bookId);
       if (parsed.data.pageCount < maxPage) {
         throw new AppError(409, 'PAGE_COUNT_TOO_SMALL', `总页数不能小于已有痕迹的最大页码 ${maxPage}`);
       }

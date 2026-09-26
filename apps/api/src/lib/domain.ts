@@ -46,6 +46,50 @@ export function validateSinglePage(pageNumber: number, pageCount: number | null)
   }
 }
 
+export function validateExistingSinglePage(
+  nextPage: number,
+  currentPage: number,
+  pageCount: number | null
+): void {
+  parsePositivePage(nextPage);
+  if (pageCount !== null && nextPage > pageCount && nextPage !== currentPage) {
+    throw new AppError(422, 'VALIDATION_ERROR', `页码不能超过总页数 ${pageCount}`, {
+      pageNumber: `页码不能超过总页数 ${pageCount}`
+    });
+  }
+}
+
+export function validateExistingPageRange(
+  nextStartPage: number,
+  nextEndPage: number,
+  currentStartPage: number,
+  currentEndPage: number,
+  pageCount: number | null
+): void {
+  parsePositivePage(nextStartPage, 'startPage');
+  parsePositivePage(nextEndPage, 'endPage');
+  if (nextStartPage > nextEndPage) {
+    throw new AppError(422, 'VALIDATION_ERROR', '起始页不能大于结束页', {
+      endPage: '结束页必须大于等于起始页'
+    });
+  }
+  const rangeUnchanged = nextStartPage === currentStartPage && nextEndPage === currentEndPage;
+  if (pageCount !== null && nextEndPage > pageCount && !rangeUnchanged) {
+    throw new AppError(422, 'VALIDATION_ERROR', `页码不能超过总页数 ${pageCount}`, {
+      endPage: `页码不能超过总页数 ${pageCount}`
+    });
+  }
+}
+
+export function reconcilePageCountWithTracePage(
+  pageCount: number | null,
+  maxTracePage: number
+): number | null {
+  if (pageCount === null) return null;
+  if (!Number.isInteger(maxTracePage) || maxTracePage <= 0) return pageCount;
+  return Math.max(pageCount, maxTracePage);
+}
+
 export function assertBookStatus(value: string): asserts value is BookStatus {
   if (!BOOK_STATUSES.includes(value as BookStatus)) {
     throw new AppError(422, 'VALIDATION_ERROR', '书目状态无效', { status: '书目状态无效' });

@@ -75,6 +75,9 @@ function summary(event: TimelineEvent): string {
   if (Array.isArray(payload.moodTags)) {
     return payload.moodTags.map((tag) => MOOD_LABELS[tag as MoodTag] ?? tag).join('、');
   }
+  if (typeof payload.previousPageCount === 'number' && typeof payload.pageCount === 'number') {
+    return `总页数 ${payload.previousPageCount} → ${payload.pageCount}`;
+  }
   if (typeof payload.previousStatus === 'string' && typeof payload.nextStatus === 'string') {
     return `${payload.previousStatus} → ${payload.nextStatus}`;
   }

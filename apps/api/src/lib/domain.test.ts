@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { isRestoreWindowOpen, isStrictlyEditable, normalizeMoodTags, validatePageRange, validateStatusTransition } from './domain.js';
+import {
+  isRestoreWindowOpen,
+  isStrictlyEditable,
+  normalizeMoodTags,
+  reconcilePageCountWithTracePage,
+  validateExistingPageRange,
+  validateExistingSinglePage,
+  validatePageRange,
+  validateStatusTransition
+} from './domain.js';
 import { AppError } from './errors.js';
 
 describe('domain rules', () => {
@@ -22,6 +31,22 @@ describe('domain rules', () => {
   it('normalizes mood tags and rejects empty or duplicate overrun', () => {
     expect(normalizeMoodTags(['MOVED', 'MOVED', 'CALM'])).toEqual(['MOVED', 'CALM']);
     expect(() => normalizeMoodTags([])).toThrow(AppError);
+  });
+
+  it('allows unchanged legacy out-of-bounds pages while rejecting new out-of-bounds pages', () => {
+    expect(() => validateExistingSinglePage(120, 120, 100)).not.toThrow();
+    expect(() => validateExistingSinglePage(100, 120, 100)).not.toThrow();
+    expect(() => validateExistingSinglePage(101, 120, 100)).toThrow(AppError);
+    expect(() => validateExistingPageRange(110, 120, 110, 120, 100)).not.toThrow();
+    expect(() => validateExistingPageRange(90, 100, 110, 120, 100)).not.toThrow();
+    expect(() => validateExistingPageRange(90, 120, 110, 120, 100)).toThrow(AppError);
+  });
+
+  it('reconciles a declared page count deterministically while leaving unknown page counts alone', () => {
+    expect(reconcilePageCountWithTracePage(100, 120)).toBe(120);
+    expect(reconcilePageCountWithTracePage(120, 100)).toBe(120);
+    expect(reconcilePageCountWithTracePage(null, 120)).toBeNull();
+    expect(reconcilePageCountWithTracePage(100, 0)).toBe(100);
   });
 
   it('enforces restore and edit windows', () => {

@@ -5,7 +5,15 @@ import { TRACE_TYPES, type TraceType } from '@paper-book-traces/shared';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
-import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
+import {
+  isRestoreWindowOpen,
+  normalizeText,
+  validateExistingPageRange,
+  validateExistingSinglePage,
+  validatePageRange,
+  validateSinglePage
+} from '../../lib/domain.js';
+import { reconcileBookPageCountWithActiveTraces } from '../../lib/traceConsistency.js';
 import { writeEvent } from '../../lib/events.js';
 import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
 
@@ -109,6 +117,42 @@ function assertVersion(current: number, requested?: number): void {
 
 function eventSummary(value: string | null | undefined): string {
   return (value ? normalizeText(value).slice(0, 120) : '');
+}
+
+async function reconcileRestoredTraceBook(
+  tx: Prisma.TransactionClient,
+  input: { userId: string; bookId: string; previousPageCount: number | null }
+): Promise<{ pageCount: number | null; changed: boolean }> {
+  const reconciliation = await reconcileBookPageCountWithActiveTraces(tx, {
+    userId: input.userId,
+    bookId: input.bookId,
+    pageCount: input.previousPageCount
+  });
+  const pageCount = reconciliation.pageCount;
+  if (pageCount === input.previousPageCount) return { pageCount, changed: false };
+
+  await tx.book.update({
+    where: { id: input.bookId },
+    data: { pageCount, version: { increment: 1 } }
+  });
+  await writeEvent(tx, {
+    userId: input.userId,
+    bookId: input.bookId,
+    entityType: 'BOOK',
+    entityId: input.bookId,
+    action: 'UPDATED',
+    payload: {
+      previousPageCount: input.previousPageCount,
+      pageCount,
+      maxTracePage: reconciliation.maxTracePage,
+      reason: 'trace_restored'
+    }
+  });
+  return { pageCount, changed: true };
+}
+
+async function lockBook(tx: Prisma.TransactionClient, bookId: string): Promise<void> {
+  await tx.$executeRaw`SELECT id FROM books WHERE id = ${bookId}::uuid FOR UPDATE`;
 }
 
 export const traceRoutes: FastifyPluginAsync = async (app) => {
@@ -245,7 +289,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '折角不存在');
     assertVersion(existing.version, parsed.data.version);
     const nextPage = parsed.data.pageNumber ?? existing.pageNumber;
-    validateSinglePage(nextPage, existing.book.pageCount);
+    validateExistingSinglePage(nextPage, existing.pageNumber, existing.book.pageCount);
     const nextReason =
       parsed.data.reason === undefined
         ? existing.reason
@@ -316,25 +360,44 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
     }
     if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
-    const duplicate = await prisma.dogEar.findFirst({
-      where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
-    });
-    if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
-    const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.dogEar.update({
-        where: { id },
+    let restored;
+    try {
+      restored = await prisma.$transaction(async (tx) => {
+        await lockBook(tx, existing.bookId);
+      const activeBook = await tx.book.findUniqueOrThrow({ where: { id: existing.bookId } });
+      if (activeBook.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      const activeDuplicate = await tx.dogEar.findFirst({
+        where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
+      });
+      if (activeDuplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
+
+      const result = await tx.dogEar.updateMany({
+        where: { id, userId, deletedAt: { not: null }, version: existing.version },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '折角已在其他位置被修改');
+      const value = await tx.dogEar.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'DOG_EAR',
         entityId: id,
         action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
+        payload: { pageNumber: value.pageNumber, previousPageCount: activeBook.pageCount }
+      });
+      await reconcileRestoredTraceBook(tx, {
+        userId,
+        bookId: value.bookId,
+        previousPageCount: activeBook.pageCount
       });
       return value;
     });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
+      }
+      throw error;
+    }
     return { dogEar: serializeDogEar(restored) };
   });
 
@@ -382,7 +445,13 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     assertVersion(existing.version, parsed.data.version);
     const startPage = parsed.data.startPage ?? existing.startPage;
     const endPage = parsed.data.endPage ?? existing.endPage;
-    validatePageRange(startPage, endPage, existing.book.pageCount);
+    validateExistingPageRange(
+      startPage,
+      endPage,
+      existing.startPage,
+      existing.endPage,
+      existing.book.pageCount
+    );
     const updated = await prisma.$transaction(async (tx) => {
       const result = await tx.annotation.updateMany({
         where: { id, userId, deletedAt: null, version: existing.version },
@@ -443,17 +512,28 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     }
     if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.annotation.update({
-        where: { id },
+      await lockBook(tx, existing.bookId);
+      const activeBook = await tx.book.findUniqueOrThrow({ where: { id: existing.bookId } });
+      if (activeBook.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+
+      const result = await tx.annotation.updateMany({
+        where: { id, userId, deletedAt: { not: null }, version: existing.version },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '批注已在其他位置被修改');
+      const value = await tx.annotation.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'ANNOTATION',
         entityId: id,
         action: 'RESTORED',
-        payload: { startPage: value.startPage, endPage: value.endPage }
+        payload: { startPage: value.startPage, endPage: value.endPage, previousPageCount: activeBook.pageCount }
+      });
+      await reconcileRestoredTraceBook(tx, {
+        userId,
+        bookId: value.bookId,
+        previousPageCount: activeBook.pageCount
       });
       return value;
     });
@@ -564,17 +644,28 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     }
     if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.rereadMark.update({
-        where: { id },
+      await lockBook(tx, existing.bookId);
+      const activeBook = await tx.book.findUniqueOrThrow({ where: { id: existing.bookId } });
+      if (activeBook.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+
+      const result = await tx.rereadMark.updateMany({
+        where: { id, userId, deletedAt: { not: null }, version: existing.version },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '重读记录已在其他位置被修改');
+      const value = await tx.rereadMark.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
+        payload: { pageNumber: value.pageNumber, previousPageCount: activeBook.pageCount }
+      });
+      await reconcileRestoredTraceBook(tx, {
+        userId,
+        bookId: value.bookId,
+        previousPageCount: activeBook.pageCount
       });
       return value;
     });
